@@ -31,7 +31,7 @@ COLD_MONTHS = {"январь 2026", "декабрь 2025"}
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
 MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))
 
-# Временное окно (если надо)
+# Временное окно (если нужно)
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
 
@@ -336,7 +336,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     return result
 
 
-# ===== update values only (no formatting) =====
+# ===== update values only (no formatting, no headers overwrite) =====
 def find_anchor_row(service, spreadsheet_id, sheet_title, anchor_text):
     values = read_values(service, spreadsheet_id, f"{sheet_title}!A1:M200")
     anchor_low = anchor_text.lower()
@@ -351,19 +351,9 @@ def update_values_only(service, sheet_title, our_month_name, yandex_month_name, 
     our_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "НАША СЕТКА")
     yandex_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "ЯНДЕКС СЕТКА")
 
-    # если лист не размечен — fallback
+    # КРИТИЧНО: если якорей нет — НЕ ПИШЕМ (чтобы не снести заголовки)
     if not our_title_row or not yandex_title_row:
-        values = []
-        values.append([f"НАША СЕТКА ({our_month_name or '-'})"] + [""] * 12)
-        values.append(HEADERS)
-        values.extend(our_data if our_data else [])
-        for _ in range(5):
-            values.append([""] * 13)
-        values.append([f"ЯНДЕКС СЕТКА ({yandex_month_name or '-'})"] + [""] * 12)
-        values.append(HEADERS)
-        values.extend(yandex_data if yandex_data else [])
-        end_row = len(values)
-        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A1:M{end_row}", values)
+        print(f"[WARN] Anchors not found in '{sheet_title}'. Skip write to avoid touching headers.")
         return
 
     our_data_start = our_title_row + 2
@@ -375,7 +365,7 @@ def update_values_only(service, sheet_title, our_month_name, yandex_month_name, 
     our_end = our_data_start + len(our_data) - 1
     write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_data_start}:M{our_end}", our_data)
 
-    # чистим хвост OUR
+    # clear tail OUR
     our_tail_start = our_end + 1
     our_tail_end = our_data_start + MAX_DATA_ROWS - 1
     if our_tail_start <= our_tail_end:
@@ -388,7 +378,7 @@ def update_values_only(service, sheet_title, our_month_name, yandex_month_name, 
     y_end = yandex_data_start + len(yandex_data) - 1
     write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{yandex_data_start}:M{y_end}", yandex_data)
 
-    # чистим хвост Yandex
+    # clear tail Yandex
     y_tail_start = y_end + 1
     y_tail_end = yandex_data_start + MAX_DATA_ROWS - 1
     if y_tail_start <= y_tail_end:
@@ -396,7 +386,6 @@ def update_values_only(service, sheet_title, our_month_name, yandex_month_name, 
         write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{y_tail_start}:M{y_tail_end}", blanks)
 
 
-# ===== runner =====
 def run_summary_once():
     dt = now_local()
     if not in_work_window(dt):
@@ -443,6 +432,7 @@ def run_summary_once():
 
         if st.get("hash") != new_hash and (time.time() - float(st.get("last_write_ts", 0)) >= HOT_WRITE_INTERVAL_SEC):
             real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
+
             update_values_only(service, real_title, a, b, our_data, yandex_data)
 
             updated = now_local().strftime("%d.%m %H:%M")
@@ -455,7 +445,7 @@ def run_summary_once():
     else:
         print(f"[WARN] HOT_MONTH '{HOT_MONTH}' не найден в Settings")
 
-    # --- COLD: только Январь и Декабрь раз в 24ч ---
+    # --- COLD: только Январь + Декабрь раз в 24ч ---
     for a, b in pairs:
         raw = (a or b or "").strip()
         if not raw:
@@ -463,11 +453,9 @@ def run_summary_once():
 
         raw_l = raw.lower()
 
-        # пропускаем HOT
         if raw_l == HOT_MONTH.strip().lower():
             continue
 
-        # обновляем только COLD месяцы
         if raw_l not in COLD_MONTHS:
             continue
 
@@ -481,6 +469,7 @@ def run_summary_once():
         yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, b)
 
         real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
+
         update_values_only(service, real_title, a, b, our_data, yandex_data)
 
         updated = now_local().strftime("%d.%m %H:%M")
