@@ -9,6 +9,7 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
+# ===================== ENV / CONST =====================
 SUMMARY_SPREADSHEET_ID = os.environ["SUMMARY_SPREADSHEET_ID"]
 OUR_GRID_ID = os.environ["OUR_GRID_ID"]
 YANDEX_GRID_ID = os.environ["YANDEX_GRID_ID"]
@@ -23,23 +24,29 @@ COLD_REFRESH_SEC = int(os.getenv("COLD_REFRESH_SEC", str(24 * 60 * 60)))
 COLD_MONTHS = {"январь 2026", "декабрь 2025"}
 
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
+
+# IMPORTANT: MAX rows for YANDEX data block cleanup
 MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))
 
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
 
-# ===== ТЕК DATA ЖАЗАТЫН БЕКІТІЛГЕН ROW-ЛАР =====
-OUR_DATA_START_ROW = 3  # барлық айда тұрақты
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# YANDEX data row айға қарай өзгереді (скрин бойынша)
+# ===================== STRICT DATA AREAS (NO HEADERS) =====================
+# 1) НАША СЕТКА: only A3:M18 (data) -> never touch headers (A1:A2) and never touch rows 19-20
+OUR_DATA_START_ROW = 3
+OUR_DATA_END_ROW = 18
+OUR_MAX_ROWS = OUR_DATA_END_ROW - OUR_DATA_START_ROW + 1  # 16 rows
+
+# 2) ЯНДЕКС СЕТКА: data start depends on month
 YANDEX_DATA_START_BY_MONTH = {
     "февраль 2026": 21,
     "январь 2026": 21,
     "декабрь 2025": 23,
 }
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
+# ===================== PARSE KEYWORDS =====================
 KEYWORDS = {
     "MANAGER": ["менеджер", "сотрудник", "manager"],
     "OPF": ["опф", "форма"],
@@ -49,6 +56,7 @@ KEYWORDS = {
 }
 
 
+# ===================== TIME HELPERS =====================
 def now_local():
     return datetime.now(ZoneInfo(TZ))
 
@@ -57,6 +65,7 @@ def in_work_window(dt):
     return WORK_START_HOUR <= dt.hour < WORK_END_HOUR
 
 
+# ===================== STRING HELPERS =====================
 def normalize_name(name):
     if not name:
         return None
@@ -79,6 +88,7 @@ def compute_hash(values):
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+# ===================== GOOGLE API HELPERS =====================
 def api_call_with_backoff(fn, max_retries=8, base_sleep=1.0):
     for attempt in range(max_retries):
         try:
@@ -112,6 +122,7 @@ def read_values(service, spreadsheet_id, a1_range):
             range=a1_range,
             valueRenderOption="FORMATTED_VALUE",
         ).execute()
+
     resp = api_call_with_backoff(_call)
     return resp.get("values", [])
 
@@ -124,12 +135,14 @@ def write_values(service, spreadsheet_id, a1_range, values):
             valueInputOption="RAW",
             body={"values": values},
         ).execute()
+
     api_call_with_backoff(_call)
 
 
 def get_sheet_titles_lower(service, spreadsheet_id):
     def _call():
         return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+
     meta = api_call_with_backoff(_call)
     mapping = {}
     for s in meta.get("sheets", []):
@@ -173,7 +186,7 @@ def find_sheet_smart(titles_lower, partial_name):
     return None
 
 
-# ===== hot state =====
+# ===================== HOT STATE =====================
 def state_path(report_sheet_name):
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", report_sheet_name)
     return f"/tmp/state_{safe}.json"
@@ -192,7 +205,7 @@ def write_state(report_sheet_name, state):
         json.dump(state, f)
 
 
-# ===== cold state =====
+# ===================== COLD STATE =====================
 def cold_state_path():
     return "/tmp/cold_refresh_state.json"
 
@@ -222,7 +235,11 @@ def mark_refreshed_cold(key):
     write_cold_state(st)
 
 
+# ===================== ANALYZE =====================
 def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
+    """
+    Reads a source sheet and returns rows (A:M) for the summary data area.
+    """
     if not sheet_name:
         return []
 
@@ -272,8 +289,17 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
 
         if manager not in stats:
             stats[manager] = {
-                "total": 0, "ip": 0, "too": 0, "contract": 0, "accept": 0,
-                "nib_sale": 0, "nib": 0, "zero": 0, "empty_tag": 0, "other_tag": 0, "red": 0
+                "total": 0,
+                "ip": 0,
+                "too": 0,
+                "contract": 0,
+                "accept": 0,
+                "nib_sale": 0,
+                "nib": 0,
+                "zero": 0,
+                "empty_tag": 0,
+                "other_tag": 0,
+                "red": 0,
             }
 
         s = stats[manager]
@@ -322,7 +348,8 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     result = []
     for m, s in stats.items():
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
-        percent_str = f"{round(percent * 100)}%"  # әрқашан процент
+        # requirement: write "11%" like string, not numeric/format-dependent
+        percent_str = f"{round(percent * 100)}%"
 
         result.append([
             m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
@@ -333,24 +360,51 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     return result
 
 
-def write_block_values_only(service, sheet_title, start_row, data_rows):
-    if not data_rows:
-        data_rows = [[""] * 13
+# ===================== WRITE ONLY DATA BLOCKS (NO HEADER TOUCH) =====================
+def _pad_or_trim_row(row, width=13):
+    row = list(row) if row else []
+    if len(row) < width:
+        row += [""] * (width - len(row))
+    elif len(row) > width:
+        row = row[:width]
+    return row
 
-                    ]
 
-    end_row = start_row + len(data_rows) - 1
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{start_row}:M{end_row}", data_rows)
+def write_data_block(service, sheet_title, start_row, max_rows, data_rows):
+    """
+    STRICT:
+    - Writes ONLY within [start_row .. start_row+max_rows-1] and columns A:M.
+    - Does NOT touch any header rows outside this block.
+    - Clears tail inside the same block so no old "хвост" remains.
+    """
+    width = 13  # A..M
 
+    # normalize data
+    clean = [_pad_or_trim_row(r, width) for r in (data_rows or [])]
+
+    # truncate to max_rows (never overflow into headers / other blocks)
+    clean = clean[:max_rows]
+
+    # ensure at least 1 row write (optional; can also write 0 rows, but update requires range)
+    if len(clean) == 0:
+        clean = [[""] * width]
+
+    write_len = len(clean)
+    end_row = start_row + write_len - 1
+
+    # 1) write actual data
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{start_row}:M{end_row}", clean)
+
+    # 2) clear tail inside the same block only
+    block_end_row = start_row + max_rows - 1
     tail_start = end_row + 1
-    tail_end = start_row + MAX_DATA_ROWS - 1
-    if tail_start <= tail_end:
-        blanks = [[""] * 13 for _ in range(tail_end - tail_start + 1)]
-        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{tail_start}:M{tail_end}", blanks)
+    if tail_start <= block_end_row:
+        blanks = [[""] * width for _ in range(block_end_row - tail_start + 1)]
+        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{tail_start}:M{block_end_row}", blanks)
 
 
 def yandex_start_for_month(month_name: str) -> int:
-    return YANDEX_DATA_START_BY_MONTH.get(month_name.strip().lower(), 21)  # default 21
+    return YANDEX_DATA_START_BY_MONTH.get(month_name.strip().lower(), 21)
 
 
 def run_month_update(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, month_name, our_sheet, yandex_sheet):
@@ -360,11 +414,16 @@ def run_month_update(service, summary_titles_lower, our_titles_lower, yandex_tit
     our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_sheet)
     yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_sheet)
 
-    # ТЕК data аймақтарын жазамыз
-    write_block_values_only(service, real_title, OUR_DATA_START_ROW, our_data)
-    write_block_values_only(service, real_title, yandex_start_for_month(month_name), yandex_data)
+    # STRICT: write only fixed data blocks
+    # 1) НАША СЕТКА: A3:M18 (16 rows) only
+    write_data_block(service, real_title, OUR_DATA_START_ROW, OUR_MAX_ROWS, our_data)
 
-    updated = now_local().strftime("%d.%m %H:%M")
+    # 2) ЯНДЕКС СЕТКА: start depends on month; cleanup within MAX_DATA_ROWS rows
+    y_start = yandex_start_for_month(month_name)
+    write_data_block(service, real_title, y_start, MAX_DATA_ROWS, yandex_data)
+
+    # status cell (outside headers of blocks; you control this)
+    updated = now_local().strftime("%d.%m %H:%M:%S")
     write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
 
     return our_data, yandex_data, report_sheet_name, real_title
@@ -392,11 +451,12 @@ def run_summary_once():
         if not month:
             continue
         pairs.append((month, str(a).strip(), str(b).strip()))
+
     if not pairs:
         print("[WARN] Settings empty")
         return
 
-    # HOT always
+    # ================= HOT =================
     hot = None
     for month, a, b in pairs:
         if month.lower() == HOT_MONTH.strip().lower():
@@ -407,21 +467,26 @@ def run_summary_once():
         month, a, b = hot
         our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, a)
         yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, b)
+
         new_hash = compute_hash([our_data, yandex_data])
 
         report_sheet_name = f"Сводная - {month}"
         st = read_state(report_sheet_name)
 
-        if st.get("hash") != new_hash and (time.time() - float(st.get("last_write_ts", 0)) >= HOT_WRITE_INTERVAL_SEC):
+        throttled = (time.time() - float(st.get("last_write_ts", 0))) < HOT_WRITE_INTERVAL_SEC
+        changed = st.get("hash") != new_hash
+
+        if changed and not throttled:
             run_month_update(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, month, a, b)
             write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
             print(f"[OK] HOT SYNC: {report_sheet_name}")
         else:
-            print(f"[INFO] HOT NO-CHANGE/THROTTLE: {report_sheet_name}")
+            reason = "THROTTLE" if throttled else "NO-CHANGE"
+            print(f"[INFO] HOT {reason}: {report_sheet_name}")
     else:
         print(f"[WARN] HOT_MONTH '{HOT_MONTH}' not found in Settings")
 
-    # COLD daily
+    # ================= COLD =================
     for month, a, b in pairs:
         ml = month.lower()
         if ml == HOT_MONTH.strip().lower():
