@@ -9,7 +9,6 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-# ===== IDs / Settings =====
 SUMMARY_SPREADSHEET_ID = os.environ["SUMMARY_SPREADSHEET_ID"]
 OUR_GRID_ID = os.environ["OUR_GRID_ID"]
 YANDEX_GRID_ID = os.environ["YANDEX_GRID_ID"]
@@ -17,13 +16,11 @@ SUMMARY_SETTINGS_SHEET_NAME = os.getenv("SUMMARY_SETTINGS_SHEET_NAME", "Settings
 
 TZ = os.getenv("TZ", "Asia/Almaty")
 
-# HOT month: каждые 15 сек
 HOT_MONTH = os.getenv("HOT_MONTH", "Февраль 2026")
 HOT_WRITE_INTERVAL_SEC = int(os.getenv("HOT_WRITE_INTERVAL_SEC", "15"))
 
-# COLD months: раз в 24 часа
 COLD_REFRESH_SEC = int(os.getenv("COLD_REFRESH_SEC", str(24 * 60 * 60)))
-COLD_MONTHS = {"январь 2026", "декабрь 2025"}  # только эти
+COLD_MONTHS = {"январь 2026", "декабрь 2025"}
 
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
 MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))
@@ -40,11 +37,6 @@ KEYWORDS = {
     "ACCEPT": ["акцепт", "платежки", "оплата", "поехали"],
     "TAGS": ["метки", "наличие метки", "nib"],
 }
-
-HEADERS = [
-    "Менеджеры", "Офферты всего", "ИП", "ТОО", "Договор есть", "Акцепт/Оплата",
-    "Акцепт %", "Метка nib_sales", "Метка nib", "Метка 0", "Пусто", "Другое", "Красные"
-]
 
 
 def now_local():
@@ -110,6 +102,7 @@ def read_values(service, spreadsheet_id, a1_range):
             range=a1_range,
             valueRenderOption="FORMATTED_VALUE",
         ).execute()
+
     resp = api_call_with_backoff(_call)
     return resp.get("values", [])
 
@@ -122,12 +115,14 @@ def write_values(service, spreadsheet_id, a1_range, values):
             valueInputOption="RAW",
             body={"values": values},
         ).execute()
+
     api_call_with_backoff(_call)
 
 
 def get_sheet_titles_lower(service, spreadsheet_id):
     def _call():
         return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+
     meta = api_call_with_backoff(_call)
     mapping = {}
     for s in meta.get("sheets", []):
@@ -160,6 +155,7 @@ def ensure_sheet_exists(service, spreadsheet_id, sheet_name, titles_lower):
 def find_sheet_smart(titles_lower, partial_name):
     if not partial_name:
         return None
+
     search = str(partial_name).strip().lower()
     search_clean = re.sub(r"\s+", "", search)
 
@@ -170,10 +166,11 @@ def find_sheet_smart(titles_lower, partial_name):
         clean = re.sub(r"\s+", "", low)
         if (search_clean in clean) or (clean in search_clean):
             return real
+
     return None
 
 
-# ===== states =====
+# ===== state (hot) =====
 def state_path(report_sheet_name):
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", report_sheet_name)
     return f"/tmp/state_{safe}.json"
@@ -192,6 +189,7 @@ def write_state(report_sheet_name, state):
         json.dump(state, f)
 
 
+# ===== state (cold daily) =====
 def cold_state_path():
     return "/tmp/cold_refresh_state.json"
 
@@ -228,11 +226,11 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
 
     real_name = find_sheet_smart(source_titles_lower, sheet_name)
     if not real_name:
-        return [["❌ Лист не найден"] + [""] * 12]
+        return []
 
     data = read_values(service, source_id, real_name)
     if len(data) < 2:
-        return [["Лист пуст"] + [""] * 12]
+        return []
 
     headers = [str(h).lower().strip() for h in data[0]]
 
@@ -249,7 +247,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
         idx["man"] = find_idx(headers2, KEYWORDS["MANAGER"])
 
     if idx["man"] == -1:
-        return [["Не найдена колонка Менеджер"] + [""] * 12]
+        return []
 
     stats = {}
     is_red_section = False
@@ -268,7 +266,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
             consecutive_empty_rows = 0
 
         manager = normalize_name(manager_raw)
-        if not manager or manager.lower() == "менеджер":
+        if not manager:
             continue
 
         if manager not in stats:
@@ -322,9 +320,8 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
 
     result = []
     for m, s in stats.items():
-        # ПИШЕМ ПРОЦЕНТ СТРОКОЙ, ЧТОБЫ НЕ ЗАВИСЕТЬ ОТ ФОРМАТА ЯЧЕЙКИ
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
-        percent_str = f"{round(percent * 100)}%"
+        percent_str = f"{round(percent * 100)}%"  # әрқашан процент түрінде
 
         result.append([
             m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
@@ -335,60 +332,66 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     return result
 
 
-# ===== update values only (no formatting, no headers overwrite) =====
-def find_anchor_row(service, spreadsheet_id, sheet_title, anchor_text):
-    values = read_values(service, spreadsheet_id, f"{sheet_title}!A1:M200")
-    anchor_low = anchor_text.lower()
-    for r, row in enumerate(values, start=1):
-        for c in row:
-            if anchor_low in str(c).lower():
-                return r
-    return None
+# ===== template-aware data writer (does NOT touch headers) =====
+def find_all_header_rows(service, spreadsheet_id, sheet_title, start_row, end_row):
+    # Іздейміз "Менеджеры" A..M диапазонда, бірнеше рет кездесуі мүмкін (OUR және Yandex)
+    rng = f"{sheet_title}!A{start_row}:M{end_row}"
+    values = read_values(service, spreadsheet_id, rng)
+    res = []
+    for i, row in enumerate(values):
+        for cell in row:
+            if str(cell).strip().lower() == "менеджеры":
+                res.append(start_row + i)
+                break
+    return res
 
 
-def update_values_only(service, sheet_title, our_month_name, yandex_month_name, our_data, yandex_data):
-    our_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "НАША СЕТКА")
-    yandex_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "ЯНДЕКС СЕТКА")
+def write_block_values_only(service, sheet_title, start_row, data_rows):
+    if not data_rows:
+        data_rows = [[""] * 13]
 
-    # КРИТИЧНО: если якорей нет — НЕ ПИШЕМ (чтобы не снести заголовки)
-    if not our_title_row or not yandex_title_row:
-        print(f"[WARN] Anchors not found in '{sheet_title}'. Skip write to avoid touching headers.")
-        return
+    # write data
+    end_row = start_row + len(data_rows) - 1
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{start_row}:M{end_row}", data_rows)
 
-    our_data_start = our_title_row + 2
-    yandex_data_start = yandex_title_row + 2
+    # clear tail
+    tail_start = end_row + 1
+    tail_end = start_row + MAX_DATA_ROWS - 1
+    if tail_start <= tail_end:
+        blanks = [[""] * 13 for _ in range(tail_end - tail_start + 1)]
+        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{tail_start}:M{tail_end}", blanks)
 
-    # OUR
-    if not our_data:
-        our_data = [[""] * 13]
-    our_end = our_data_start + len(our_data) - 1
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_data_start}:M{our_end}", our_data)
 
-    # clear tail OUR
-    our_tail_start = our_end + 1
-    our_tail_end = our_data_start + MAX_DATA_ROWS - 1
-    if our_tail_start <= our_tail_end:
-        blanks = [[""] * 13 for _ in range(our_tail_end - our_tail_start + 1)]
-        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_tail_start}:M{our_tail_end}", blanks)
+def run_month_update(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, month_name, our_sheet, yandex_sheet):
+    report_sheet_name = f"Сводная - {month_name}"
+    real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
 
-    # Yandex
-    if not yandex_data:
-        yandex_data = [[""] * 13]
-    y_end = yandex_data_start + len(yandex_data) - 1
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{yandex_data_start}:M{y_end}", yandex_data)
+    # find header rows in target sheet (OUR header first, Yandex header second)
+    hdr_rows = find_all_header_rows(service, SUMMARY_SPREADSHEET_ID, real_title, 1, 120)
+    if len(hdr_rows) < 2:
+        print(f"[WARN] 'Менеджеры' headers not found twice in '{real_title}'. Skip to avoid touching headers.")
+        return None
 
-    # clear tail Yandex
-    y_tail_start = y_end + 1
-    y_tail_end = yandex_data_start + MAX_DATA_ROWS - 1
-    if y_tail_start <= y_tail_end:
-        blanks = [[""] * 13 for _ in range(y_tail_end - y_tail_start + 1)]
-        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{y_tail_start}:M{y_tail_end}", blanks)
+    our_data_start = hdr_rows[0] + 1
+    yandex_data_start = hdr_rows[1] + 1
+
+    our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_sheet)
+    yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_sheet)
+
+    # write ONLY below headers
+    write_block_values_only(service, real_title, our_data_start, our_data)
+    write_block_values_only(service, real_title, yandex_data_start, yandex_data)
+
+    updated = now_local().strftime("%d.%m %H:%M")
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
+
+    return our_data, yandex_data, report_sheet_name, real_title
 
 
 def run_summary_once():
     dt = now_local()
     if not in_work_window(dt):
-        print("[INFO] вне времени — пропуск")
+        print("[INFO] outside work window -> skip")
         return
 
     service = get_service()
@@ -399,80 +402,56 @@ def run_summary_once():
 
     settings = read_values(service, SUMMARY_SPREADSHEET_ID, f"{SUMMARY_SETTINGS_SHEET_NAME}!A2:B")
 
+    # pairs: (month_name, our_sheet_name, yandex_sheet_name)
     pairs = []
     for row in settings:
         a = row[0] if len(row) > 0 else ""
         b = row[1] if len(row) > 1 else ""
-        if (not str(a).strip()) and (not str(b).strip()):
+        month = (a or b or "").strip()
+        if not month:
             continue
-        pairs.append((str(a).strip(), str(b).strip()))
+        pairs.append((month, str(a).strip(), str(b).strip()))
     if not pairs:
-        print("[WARN] нет пар в Settings")
+        print("[WARN] Settings empty")
         return
 
-    # --- HOT: всегда ---
-    hot_pair = None
-    for a, b in pairs:
-        raw = (a or b or "").strip().lower()
-        if raw == HOT_MONTH.strip().lower():
-            hot_pair = (a, b)
+    # HOT always
+    hot = None
+    for month, a, b in pairs:
+        if month.lower() == HOT_MONTH.strip().lower():
+            hot = (month, a, b)
             break
 
-    if hot_pair:
-        a, b = hot_pair
-        raw_name = (a or b or "").strip()
-        report_sheet_name = f"Сводная - {raw_name}"
+    if hot:
+        month, a, b = hot
 
         our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, a)
         yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, b)
-
         new_hash = compute_hash([our_data, yandex_data])
+
+        report_sheet_name = f"Сводная - {month}"
         st = read_state(report_sheet_name)
 
         if st.get("hash") != new_hash and (time.time() - float(st.get("last_write_ts", 0)) >= HOT_WRITE_INTERVAL_SEC):
-            real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
-
-            update_values_only(service, real_title, a, b, our_data, yandex_data)
-
-            updated = now_local().strftime("%d.%m %H:%M")
-            write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
-
+            run_month_update(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, month, a, b)
             write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
-            print(f"[OK] HOT SYNC: {real_title}")
+            print(f"[OK] HOT SYNC: {report_sheet_name}")
         else:
             print(f"[INFO] HOT NO-CHANGE/THROTTLE: {report_sheet_name}")
     else:
-        print(f"[WARN] HOT_MONTH '{HOT_MONTH}' не найден в Settings")
+        print(f"[WARN] HOT_MONTH '{HOT_MONTH}' not found in Settings")
 
-    # --- COLD: только Январь + Декабрь раз в 24ч ---
-    for a, b in pairs:
-        raw = (a or b or "").strip()
-        if not raw:
+    # COLD daily only Jan/Dec
+    for month, a, b in pairs:
+        ml = month.lower()
+        if ml == HOT_MONTH.strip().lower():
+            continue
+        if ml not in COLD_MONTHS:
             continue
 
-        raw_l = raw.lower()
-
-        if raw_l == HOT_MONTH.strip().lower():
+        if not should_refresh_cold(ml):
             continue
 
-        if raw_l not in COLD_MONTHS:
-            continue
-
-        cold_key = raw_l
-        if not should_refresh_cold(cold_key):
-            continue
-
-        report_sheet_name = f"Сводная - {raw}"
-
-        our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, a)
-        yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, b)
-
-        real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
-
-        update_values_only(service, real_title, a, b, our_data, yandex_data)
-
-        updated = now_local().strftime("%d.%m %H:%M")
-        write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
-
-        mark_refreshed_cold(cold_key)
-        print(f"[OK] COLD SYNC (daily): {real_title}")
+        run_month_update(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, month, a, b)
+        mark_refreshed_cold(ml)
+        print(f"[OK] COLD SYNC (daily): Сводная - {month}")
