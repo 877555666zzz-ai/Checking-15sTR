@@ -37,11 +37,6 @@ HEADERS = [
     "Акцепт %", "Метка nib_sales", "Метка nib", "Метка 0", "Пусто", "Другое", "Красные"
 ]
 
-# colors (как в GAS)
-COLOR_OUR = {"red": 0.85, "green": 0.92, "blue": 0.83}     # #d9ead3
-COLOR_YAN = {"red": 1.00, "green": 0.95, "blue": 0.80}     # #fff2cc
-COLOR_HDR = {"red": 0.94, "green": 0.94, "blue": 0.94}     # #efefef
-
 
 def now_local():
     return datetime.now(ZoneInfo(TZ))
@@ -66,14 +61,6 @@ def find_idx(headers, keywords):
             if k in h:
                 return i
     return -1
-
-
-def col_to_a1(n):
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
 
 
 def compute_hash(values):
@@ -166,24 +153,10 @@ def write_values(service, spreadsheet_id, a1_range, values):
     api_call_with_backoff(_call)
 
 
-def clear_range(service, spreadsheet_id, a1_range):
-    def _call():
-        return service.spreadsheets().values().clear(
-            spreadsheetId=spreadsheet_id,
-            range=a1_range,
-            body={},
-        ).execute()
-    api_call_with_backoff(_call)
-
-
-def get_sheet_meta(service, spreadsheet_id):
+def get_sheet_titles_lower(service, spreadsheet_id):
     def _call():
         return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    return api_call_with_backoff(_call)
-
-
-def get_sheet_titles_lower(service, spreadsheet_id):
-    meta = get_sheet_meta(service, spreadsheet_id)
+    meta = api_call_with_backoff(_call)
     mapping = {}
     for s in meta.get("sheets", []):
         t = s["properties"]["title"]
@@ -191,18 +164,11 @@ def get_sheet_titles_lower(service, spreadsheet_id):
     return mapping
 
 
-def get_sheet_id_by_title(service, spreadsheet_id, title_lower_map, title):
-    meta = get_sheet_meta(service, spreadsheet_id)
-    for s in meta.get("sheets", []):
-        if s["properties"]["title"].lower() == title.lower():
-            return s["properties"]["sheetId"]
-    return None
-
-
 def ensure_sheet_exists(service, spreadsheet_id, sheet_name, titles_lower):
     key = sheet_name.lower()
     if key in titles_lower:
         return titles_lower[key]
+
     req = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
 
     def _call():
@@ -237,15 +203,15 @@ def find_sheet_smart(titles_lower, partial_name):
 
 def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     if not sheet_name:
-        return [["Нет листа (пусто в Settings)"]]
+        return []
 
     real_name = find_sheet_smart(source_titles_lower, sheet_name)
     if not real_name:
-        return [[f'❌ Лист "{sheet_name}" не найден']]
+        return [["❌ Лист не найден"] + [""] * 12]
 
     data = read_values(service, source_id, real_name)
     if len(data) < 2:
-        return [["Лист пуст"]]
+        return [["Лист пуст"] + [""] * 12]
 
     headers = [str(h).lower().strip() for h in data[0]]
 
@@ -262,7 +228,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
         idx["man"] = find_idx(headers2, KEYWORDS["MANAGER"])
 
     if idx["man"] == -1:
-        return [["Не найдена колонка \"Менеджер\""]]
+        return [["Не найдена колонка Менеджер"] + [""] * 12]
 
     stats = {}
     is_red_section = False
@@ -289,6 +255,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
                 "total": 0, "ip": 0, "too": 0, "contract": 0, "accept": 0,
                 "nib_sale": 0, "nib": 0, "zero": 0, "empty_tag": 0, "other_tag": 0, "red": 0
             }
+
         s = stats[manager]
 
         if is_red_section:
@@ -344,225 +311,61 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     return result
 
 
-def build_report_values(our_title, our_data, yandex_title, yandex_data):
-    values = []
-    values.append([our_title] + [""] * 12)
-    values.append(HEADERS)
-    values.extend(our_data)
-
-    for _ in range(5):
-        values.append([""] * 13)
-
-    values.append([yandex_title] + [""] * 12)
-    values.append(HEADERS)
-    values.extend(yandex_data)
-    return values
-
-
-def batch_format_report(service, spreadsheet_id, sheet_id, our_rows, yandex_start_row, yandex_rows):
+def find_anchor_row(service, sheet_id, sheet_title, anchor_text):
     """
-    ВОССТАНАВЛИВАЕМ КРАСОТУ как Apps Script:
-    - merge заголовков
-    - заливки
-    - бордеры
-    - формат процентов
-    - conditional formatting для G (Акцепт %)
+    Ищем строку, где в A1:M200 встречается anchor_text (например 'НАША СЕТКА' или 'ЯНДЕКС СЕТКА').
+    Возвращаем 1-based row.
     """
-    def grid_range(r0, c0, r1, c1):
-        return {"sheetId": sheet_id, "startRowIndex": r0, "endRowIndex": r1, "startColumnIndex": c0, "endColumnIndex": c1}
-
-    requests = []
-
-    # Снимаем старые merges/правила форматирования на листе (чтобы не копились)
-    requests.append({"unmergeCells": {"range": {"sheetId": sheet_id}}})
-    requests.append({"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": 0}})  # может не быть — ок, ниже обработаем
-
-    # Заголовок НАША (row 0)
-    requests.append({"mergeCells": {"range": grid_range(0, 0, 1, 13), "mergeType": "MERGE_ALL"}})
-    requests.append({"repeatCell": {"range": grid_range(0, 0, 1, 13),
-                                    "cell": {"userEnteredFormat": {
-                                        "backgroundColor": COLOR_OUR,
-                                        "horizontalAlignment": "CENTER",
-                                        "textFormat": {"bold": True}
-                                    }},
-                                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat.bold)"}})
-
-    # Шапка НАША (row 1)
-    requests.append({"repeatCell": {"range": grid_range(1, 0, 2, 13),
-                                    "cell": {"userEnteredFormat": {
-                                        "backgroundColor": COLOR_HDR,
-                                        "horizontalAlignment": "CENTER",
-                                        "textFormat": {"bold": True}
-                                    }},
-                                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat.bold)"}})
-
-    # Бордеры НАША таблица: rows 0..(our_rows-1), cols 0..12
-    requests.append({"updateBorders": {
-        "range": grid_range(0, 0, our_rows, 13),
-        "top": {"style": "SOLID"},
-        "bottom": {"style": "SOLID"},
-        "left": {"style": "SOLID"},
-        "right": {"style": "SOLID"},
-        "innerHorizontal": {"style": "SOLID"},
-        "innerVertical": {"style": "SOLID"},
-    }})
-
-    # Проценты НАША: колонка G = index 6, данные начинаются row 2
-    if our_rows > 2:
-        requests.append({"repeatCell": {"range": grid_range(2, 6, our_rows, 7),
-                                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0%"}}},
-                                        "fields": "userEnteredFormat.numberFormat"}})
-
-    # Заголовок ЯНДЕКС
-    y_title_row = yandex_start_row
-    y_hdr_row = yandex_start_row + 1
-    requests.append({"mergeCells": {"range": grid_range(y_title_row, 0, y_title_row + 1, 13), "mergeType": "MERGE_ALL"}})
-    requests.append({"repeatCell": {"range": grid_range(y_title_row, 0, y_title_row + 1, 13),
-                                    "cell": {"userEnteredFormat": {
-                                        "backgroundColor": COLOR_YAN,
-                                        "horizontalAlignment": "CENTER",
-                                        "textFormat": {"bold": True}
-                                    }},
-                                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat.bold)"}})
-    requests.append({"repeatCell": {"range": grid_range(y_hdr_row, 0, y_hdr_row + 1, 13),
-                                    "cell": {"userEnteredFormat": {
-                                        "backgroundColor": COLOR_HDR,
-                                        "horizontalAlignment": "CENTER",
-                                        "textFormat": {"bold": True}
-                                    }},
-                                    "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat.bold)"}})
-
-    # Бордеры ЯНДЕКС таблица
-    y_end = yandex_start_row + yandex_rows
-    requests.append({"updateBorders": {
-        "range": grid_range(y_title_row, 0, y_end, 13),
-        "top": {"style": "SOLID"},
-        "bottom": {"style": "SOLID"},
-        "left": {"style": "SOLID"},
-        "right": {"style": "SOLID"},
-        "innerHorizontal": {"style": "SOLID"},
-        "innerVertical": {"style": "SOLID"},
-    }})
-
-    # Проценты ЯНДЕКС
-    if y_end > (y_hdr_row + 1):
-        requests.append({"repeatCell": {"range": grid_range(y_hdr_row + 1, 6, y_end, 7),
-                                        "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0%"}}},
-                                        "fields": "userEnteredFormat.numberFormat"}})
-
-    # Условное форматирование (как GAS): <0.2 красный, >=0.2 зелёный
-    # Диапазоны: G данные НАША и G данные ЯНДЕКС
-    cf_ranges = []
-    if our_rows > 2:
-        cf_ranges.append(grid_range(2, 6, our_rows, 7))
-    if y_end > (y_hdr_row + 1):
-        cf_ranges.append(grid_range(y_hdr_row + 1, 6, y_end, 7))
-
-    if cf_ranges:
-        # красный < 0.2
-        requests.append({
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": cf_ranges,
-                    "booleanRule": {
-                        "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0.2"}]},
-                        "format": {
-                            "backgroundColor": {"red": 0.956, "green": 0.78, "blue": 0.765},
-                            "textFormat": {"foregroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}}
-                        }
-                    }
-                },
-                "index": 0
-            }
-        })
-        # зелёный >= 0.2
-        requests.append({
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": cf_ranges,
-                    "booleanRule": {
-                        "condition": {"type": "NUMBER_GREATER_THAN_EQ", "values": [{"userEnteredValue": "0.2"}]},
-                        "format": {
-                            "backgroundColor": {"red": 0.718, "green": 0.882, "blue": 0.804},
-                            "textFormat": {"foregroundColor": {"red": 0.043, "green": 0.325, "blue": 0.706}}
-                        }
-                    }
-                },
-                "index": 0
-            }
-        })
-
-    # отправка batchUpdate
-    body = {"requests": requests}
-
-    def _call():
-        return service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
-
-    # deleteConditionalFormatRule может упасть если правил нет — поэтому пробуем без него при ошибке
-    try:
-        api_call_with_backoff(_call)
-    except HttpError as e:
-        msg = str(e).lower()
-        if "deleteconditionalformatrule" in msg:
-            body["requests"] = [r for r in requests if "deleteConditionalFormatRule" not in r]
-            api_call_with_backoff(lambda: service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute())
-        else:
-            raise
+    values = read_values(service, sheet_id, f"{sheet_title}!A1:M200")
+    anchor_low = anchor_text.lower()
+    for r, row in enumerate(values, start=1):
+        for c in row:
+            if anchor_low in str(c).lower():
+                return r
+    return None
 
 
-def update_one_month(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, our_sheet_name, yandex_sheet_name):
-    raw_name = (our_sheet_name or yandex_sheet_name or "").strip()
-    report_sheet_name = f"Сводная - {raw_name}"
+def update_values_only(service, sheet_title, our_month_name, yandex_month_name, our_data, yandex_data):
+    """
+    НЕ трогаем формат. Обновляем только значения:
+    - title rows остаются как есть (мы не переписываем их, можно переписать при желании)
+    - шапки остаются как есть
+    - переписываем только блоки данных
+    """
+    # ищем где начинается блок "НАША СЕТКА" и "ЯНДЕКС СЕТКА"
+    our_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "НАША СЕТКА")
+    yandex_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "ЯНДЕКС СЕТКА")
 
-    our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_sheet_name)
-    yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_sheet_name)
+    # если нет — значит лист пустой/не размечен: тогда пишем "как есть" начиная с A1
+    if not our_title_row or not yandex_title_row:
+        # fallback: просто записать таблицу целиком (значениями)
+        values = []
+        values.append([f"НАША СЕТКА ({our_month_name or '-'})"] + [""] * 12)
+        values.append(HEADERS)
+        values.extend(our_data if our_data else [])
+        for _ in range(5):
+            values.append([""] * 13)
+        values.append([f"ЯНДЕКС СЕТКА ({yandex_month_name or '-'})"] + [""] * 12)
+        values.append(HEADERS)
+        values.extend(yandex_data if yandex_data else [])
 
-    # если вернулся текст ошибки (одна ячейка) — норм, но тогда таблица будет 1 строка
-    if our_data and len(our_data[0]) == 1:
-        our_data = [our_data[0] + [""] * 12]
-    if yandex_data and len(yandex_data[0]) == 1:
-        yandex_data = [yandex_data[0] + [""] * 12]
-
-    values = build_report_values(
-        f"НАША СЕТКА ({our_sheet_name or '-'})",
-        our_data,
-        f"ЯНДЕКС СЕТКА ({yandex_sheet_name or '-'})",
-        yandex_data,
-    )
-
-    new_hash = compute_hash(values)
-    st = read_state(report_sheet_name)
-    if st.get("hash") == new_hash:
-        print(f"[INFO] NO-CHANGE: {report_sheet_name}")
-        return
-    if time.time() - float(st.get("last_write_ts", 0)) < MIN_WRITE_INTERVAL_SEC:
-        print(f"[INFO] THROTTLE: {report_sheet_name}")
+        end_row = len(values)
+        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A1:M{end_row}", values)
         return
 
-    real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
+    # данные начинаются на 2 строки ниже заголовка (title + header)
+    our_data_start = our_title_row + 2
+    yandex_data_start = yandex_title_row + 2
 
-    rows = len(values)
-    cols = 13
-    end_a1 = f"{col_to_a1(cols)}{rows}"
-    rng = f"{real_title}!A1:{end_a1}"
+    # пишем OUR data
+    if not our_data:
+        our_data = [[""] * 13]
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_data_start}:M{our_data_start + len(our_data) - 1}", our_data)
 
-    clear_range(service, SUMMARY_SPREADSHEET_ID, rng)
-    write_values(service, SUMMARY_SPREADSHEET_ID, rng, values)
-
-    # форматирование
-    sheet_id = get_sheet_id_by_title(service, SUMMARY_SPREADSHEET_ID, summary_titles_lower, real_title)
-    # our block rows:
-    our_rows = 2 + len(our_data)  # title + header + data
-    yandex_start_row = our_rows + 5  # gap 5
-    yandex_rows = 2 + len(yandex_data)
-    if sheet_id is not None:
-        batch_format_report(service, SUMMARY_SPREADSHEET_ID, sheet_id, our_rows, yandex_start_row, yandex_rows)
-
-    updated = now_local().strftime("%d.%m %H:%M")
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
-
-    write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
-    print(f"[OK] SYNC: {real_title} ({rows}x13)")
+    # пишем Yandex data
+    if not yandex_data:
+        yandex_data = [[""] * 13]
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{yandex_data_start}:M{yandex_data_start + len(yandex_data) - 1}", yandex_data)
 
 
 def run_summary_once():
@@ -595,4 +398,30 @@ def run_summary_once():
     write_cursor(end % len(pairs))
 
     for our_name, yandex_name in chosen:
-        update_one_month(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, our_name, yandex_name)
+        raw_name = (our_name or yandex_name or "").strip()
+        report_sheet_name = f"Сводная - {raw_name}"
+
+        our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_name)
+        yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_name)
+
+        # hash only from the data blocks (so stable)
+        new_hash = compute_hash([our_data, yandex_data])
+        st = read_state(report_sheet_name)
+
+        if st.get("hash") == new_hash:
+            print(f"[INFO] NO-CHANGE: {report_sheet_name}")
+            continue
+
+        if time.time() - float(st.get("last_write_ts", 0)) < MIN_WRITE_INTERVAL_SEC:
+            print(f"[INFO] THROTTLE: {report_sheet_name}")
+            continue
+
+        real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
+
+        update_values_only(service, real_title, our_name, yandex_name, our_data, yandex_data)
+
+        updated = now_local().strftime("%d.%m %H:%M")
+        write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
+
+        write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
+        print(f"[OK] SYNC VALUES: {real_title} ({len(our_data)}+{len(yandex_data)} rows)")
