@@ -13,23 +13,21 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-# ====== ENV ======
-SUMMARY_SPREADSHEET_ID = os.environ["SUMMARY_SPREADSHEET_ID"]     # куда пишем "Сводная - ..."
-OUR_GRID_ID = os.environ["OUR_GRID_ID"]                           # откуда читаем "Наша сетка"
-YANDEX_GRID_ID = os.environ["YANDEX_GRID_ID"]                     # откуда читаем "Яндекс сетка"
+SUMMARY_SPREADSHEET_ID = os.environ["SUMMARY_SPREADSHEET_ID"]
+OUR_GRID_ID = os.environ["OUR_GRID_ID"]
+YANDEX_GRID_ID = os.environ["YANDEX_GRID_ID"]
 
 SUMMARY_SETTINGS_SHEET_NAME = os.getenv("SUMMARY_SETTINGS_SHEET_NAME", "Settings")
 TZ = os.getenv("TZ", "Asia/Almaty")
 
-# worker каждые 15 сек, но писать не чаще этого (и только если изменилось)
 MIN_WRITE_INTERVAL_SEC = int(os.getenv("SUMMARY_MIN_WRITE_INTERVAL_SEC", "30"))
-
-# "красная зона" начинается после N пустых строк подряд в колонке менеджера
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
 
-# если хочешь ограничить по времени, можно поменять (по умолчанию 0-24)
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
+
+# сколько месяцев обрабатывать за 1 запуск (чтобы не упираться в лимит 60 reads/min)
+MAX_MONTHS_PER_RUN = int(os.getenv("MAX_MONTHS_PER_RUN", "2"))
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -67,11 +65,25 @@ def find_idx(headers, keywords):
     return -1
 
 
+def api_call_with_backoff(fn, *, max_retries=6, base_sleep=1.0):
+    """
+    Backoff для 429/5xx
+    """
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except HttpError as e:
+            status = getattr(e.resp, "status", None)
+            if status in (429, 500, 503):
+                sleep_s = base_sleep * (2 ** attempt)
+                print(f"[WARN] API {status}, retry in {sleep_s:.1f}s")
+                time.sleep(sleep_s)
+                continue
+            raise
+    raise RuntimeError("Too many retries for Google API")
+
+
 def get_service():
-    """
-    Railway: используем переменную GCP_SA_JSON (полный текст json).
-    Локально можно использовать GOOGLE_APPLICATION_CREDENTIALS (путь к json файлу).
-    """
     sa_json = os.getenv("GCP_SA_JSON")
     if sa_json:
         info = json.loads(sa_json)
@@ -84,53 +96,84 @@ def get_service():
 
 
 def read_values(service, spreadsheet_id: str, a1_range: str):
-    # аналог getDisplayValues()
-    resp = service.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=a1_range,
-        valueRenderOption="FORMATTED_VALUE",
-    ).execute()
+    def _call():
+        return service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=a1_range,
+            valueRenderOption="FORMATTED_VALUE",
+        ).execute()
+
+    resp = api_call_with_backoff(_call)
     return resp.get("values", [])
 
 
 def clear_sheet(service, spreadsheet_id: str, sheet_name: str):
-    service.spreadsheets().values().clear(
-        spreadsheetId=spreadsheet_id,
-        range=sheet_name,
-        body={},
-    ).execute()
+    def _call():
+        return service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_name,
+            body={},
+        ).execute()
+
+    api_call_with_backoff(_call)
 
 
 def write_values(service, spreadsheet_id: str, a1_range: str, values):
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=a1_range,
-        valueInputOption="RAW",
-        body={"values": values},
-    ).execute()
+    def _call():
+        return service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=a1_range,
+            valueInputOption="RAW",
+            body={"values": values},
+        ).execute()
+
+    api_call_with_backoff(_call)
 
 
-def get_spreadsheet_metadata(service, spreadsheet_id: str):
-    return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-
-
-def ensure_sheet_exists(service, spreadsheet_id: str, sheet_name: str):
-    meta = get_spreadsheet_metadata(service, spreadsheet_id)
-    for s in meta.get("sheets", []):
-        if s["properties"]["title"] == sheet_name:
-            return
-    req = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
-    service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
-
-
-def list_sheets(service, spreadsheet_id: str):
-    meta = get_spreadsheet_metadata(service, spreadsheet_id)
-    return [s["properties"]["title"] for s in meta.get("sheets", [])]
-
-
-def find_sheet_smart(service, spreadsheet_id: str, partial_name: str):
+def get_sheet_titles_lower(service, spreadsheet_id: str):
     """
-    Как в GAS: сначала exact, потом fuzzy includes по имени листа.
+    1 запрос метаданных и кеш по регистру: title.lower() -> real title
+    """
+    def _call():
+        return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+
+    meta = api_call_with_backoff(_call)
+    mapping = {}
+    for s in meta.get("sheets", []):
+        title = s["properties"]["title"]
+        mapping[title.lower()] = title
+    return mapping
+
+
+def ensure_sheet_exists(service, spreadsheet_id: str, sheet_name: str, titles_lower: dict):
+    """
+    FIX 400: проверяем существование БЕЗ учета регистра
+    """
+    key = sheet_name.lower()
+    if key in titles_lower:
+        return titles_lower[key]  # real title
+
+    req = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
+
+    def _call():
+        return service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+
+    try:
+        api_call_with_backoff(_call)
+        titles_lower[sheet_name.lower()] = sheet_name
+        return sheet_name
+    except HttpError as e:
+        # если лист уже существует (из-за регистра/гонки) — просто используем его
+        msg = str(e)
+        if "already exists" in msg.lower():
+            titles_lower.update(get_sheet_titles_lower(service, spreadsheet_id))
+            return titles_lower.get(key, sheet_name)
+        raise
+
+
+def find_sheet_smart(sheet_titles_lower: dict, partial_name: str):
+    """
+    Без дополнительных API запросов: ищем по уже загруженному списку листов.
     """
     if not partial_name:
         return None
@@ -139,18 +182,15 @@ def find_sheet_smart(service, spreadsheet_id: str, partial_name: str):
     search_low = search.lower()
     search_clean = re.sub(r"\s+", "", search_low)
 
-    names = list_sheets(service, spreadsheet_id)
-
-    # exact
-    for n in names:
-        if n == search:
-            return n
+    # exact (case-insensitive)
+    if search_low in sheet_titles_lower:
+        return sheet_titles_lower[search_low]
 
     # fuzzy
-    for n in names:
-        clean = re.sub(r"\s+", "", n.lower())
+    for low, real in sheet_titles_lower.items():
+        clean = re.sub(r"\s+", "", low)
         if (search_clean in clean) or (clean in search_clean):
-            return n
+            return real
 
     return None
 
@@ -180,19 +220,28 @@ def write_state(report_sheet_name: str, state: dict):
         json.dump(state, f)
 
 
-def analyze_single_sheet(service, source_id: str, sheet_name: str):
-    """
-    1-в-1 логика GAS analyzeSingleSheet():
-    - ищем лист умно
-    - шапка по ключевым словам
-    - "красная зона" после RED_GAP_ROWS пустых строк по менеджеру
-    - считаем totals/ip/too/contract/accept/nib_sale/nib/zero/empty/other/red
-    - сортировка А-Я
-    """
+def cursor_path() -> str:
+    return "/tmp/summary_cursor.json"
+
+
+def read_cursor():
+    try:
+        with open(cursor_path(), "r", encoding="utf-8") as f:
+            return json.load(f).get("i", 0)
+    except Exception:
+        return 0
+
+
+def write_cursor(i: int):
+    with open(cursor_path(), "w", encoding="utf-8") as f:
+        json.dump({"i": i}, f)
+
+
+def analyze_single_sheet(service, source_id: str, source_titles_lower: dict, sheet_name: str):
     if not sheet_name:
         return [["Нет листа (пусто в Settings)"]]
 
-    real_name = find_sheet_smart(service, source_id, sheet_name)
+    real_name = find_sheet_smart(source_titles_lower, sheet_name)
     if not real_name:
         return [[f'❌ Лист "{sheet_name}" не найден']]
 
@@ -210,7 +259,6 @@ def analyze_single_sheet(service, source_id: str, sheet_name: str):
         "tags": find_idx(headers, KEYWORDS["TAGS"]),
     }
 
-    # если шапка смещена
     if idx["man"] == -1 and len(data) > 2:
         headers2 = [str(h).lower().strip() for h in data[1]]
         idx["man"] = find_idx(headers2, KEYWORDS["MANAGER"])
@@ -226,7 +274,6 @@ def analyze_single_sheet(service, source_id: str, sheet_name: str):
         row = data[i]
         manager_raw = row[idx["man"]] if idx["man"] < len(row) else ""
 
-        # разрыв таблицы
         if not manager_raw or str(manager_raw).strip() == "":
             consecutive_empty_rows += 1
             if consecutive_empty_rows >= RED_GAP_ROWS:
@@ -247,15 +294,12 @@ def analyze_single_sheet(service, source_id: str, sheet_name: str):
 
         s = stats[manager]
 
-        # красная зона
         if is_red_section:
             s["red"] += 1
             continue
 
-        # основная зона
         s["total"] += 1
 
-        # ОПФ (как в GAS: опф + вся строка)
         opf_text = ""
         if idx["opf"] > -1 and idx["opf"] < len(row):
             opf_text += str(row[idx["opf"]]).lower()
@@ -266,19 +310,16 @@ def analyze_single_sheet(service, source_id: str, sheet_name: str):
         if "тоо" in opf_text:
             s["too"] += 1
 
-        # Договор
         if idx["contract"] > -1 and idx["contract"] < len(row):
             val = str(row[idx["contract"]]).lower().strip()
             if val not in ("", "нет", "0", "-", "—"):
                 s["contract"] += 1
 
-        # Акцепт
         if idx["accept"] > -1 and idx["accept"] < len(row):
             val = str(row[idx["accept"]]).lower()
             if len(val) > 1 and ("нет" not in val) and ("отказ" not in val) and ("ошибка" not in val):
                 s["accept"] += 1
 
-        # Метки
         tag_val = str(row[idx["tags"]]).lower().strip() if idx["tags"] > -1 and idx["tags"] < len(row) else ""
         if "nib_sale" in tag_val:
             s["nib_sale"] += 1
@@ -291,11 +332,9 @@ def analyze_single_sheet(service, source_id: str, sheet_name: str):
         else:
             s["other_tag"] += 1
 
-        # доп красные по слову
         if "красн" in " ".join(str(x).lower() for x in row):
             s["red"] += 1
 
-    # финальный массив
     result = []
     for m, s in stats.items():
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
@@ -323,8 +362,6 @@ def build_report_values(our_title: str, our_data, yandex_title: str, yandex_data
     ]
 
     values = []
-
-    # НАША СЕТКА
     values.append([our_title] + [""] * 12)
     values.append(headers)
     if our_data and len(our_data[0]) == 1:
@@ -334,11 +371,9 @@ def build_report_values(our_title: str, our_data, yandex_title: str, yandex_data
     else:
         values.append(["Нет данных"] + [""] * 12)
 
-    # gap 5 rows
     for _ in range(5):
         values.append([""] * 13)
 
-    # ЯНДЕКС СЕТКА
     values.append([yandex_title] + [""] * 12)
     values.append(headers)
     if yandex_data and len(yandex_data[0]) == 1:
@@ -351,12 +386,13 @@ def build_report_values(our_title: str, our_data, yandex_title: str, yandex_data
     return values
 
 
-def update_one_month(service, our_sheet_name: str, yandex_sheet_name: str):
+def update_one_month(service, summary_titles_lower: dict, our_titles_lower: dict, yandex_titles_lower: dict,
+                     our_sheet_name: str, yandex_sheet_name: str):
     raw_name = (our_sheet_name or yandex_sheet_name or "").strip()
     report_sheet_name = f"Сводная - {raw_name}"
 
-    our_data = analyze_single_sheet(service, OUR_GRID_ID, our_sheet_name)
-    yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_sheet_name)
+    our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_sheet_name)
+    yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_sheet_name)
 
     values = build_report_values(
         f"НАША СЕТКА ({our_sheet_name or '-'})",
@@ -365,61 +401,83 @@ def update_one_month(service, our_sheet_name: str, yandex_sheet_name: str):
         yandex_data,
     )
 
-    # hash + throttle
     new_hash = compute_hash(values)
     st = read_state(report_sheet_name)
     old_hash = st.get("hash")
     last_write = float(st.get("last_write_ts", 0))
 
     if old_hash == new_hash:
-        print(f"[INFO] SUMMARY NO-CHANGE: {report_sheet_name}")
+        print(f"[INFO] NO-CHANGE: {report_sheet_name}")
         return
 
     if time.time() - last_write < MIN_WRITE_INTERVAL_SEC:
-        print(f"[INFO] SUMMARY THROTTLE: {report_sheet_name}")
+        print(f"[INFO] THROTTLE: {report_sheet_name}")
         return
 
-    ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name)
+    real_report_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
 
     rows = len(values)
     cols = 13
     end_a1 = f"{col_to_a1(cols)}{rows}"
-    rng = f"{report_sheet_name}!A1:{end_a1}"
+    rng = f"{real_report_title}!A1:{end_a1}"
 
-    clear_sheet(service, SUMMARY_SPREADSHEET_ID, report_sheet_name)
+    clear_sheet(service, SUMMARY_SPREADSHEET_ID, real_report_title)
     write_values(service, SUMMARY_SPREADSHEET_ID, rng, values)
 
     updated = now_local().strftime("%d.%m %H:%M")
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{report_sheet_name}!N1", [[f"Обновлено: {updated}"]])
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_report_title}!N1", [[f"Обновлено: {updated}"]])
 
     write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
-    print(f"[OK] SUMMARY SYNC: {report_sheet_name} ({rows}x13)")
+    print(f"[OK] SYNC: {real_report_title} ({rows}x13)")
 
 
 def run_summary_once():
     dt = now_local()
     if not in_work_window(dt):
-        print("[INFO] SUMMARY вне времени — пропуск")
+        print("[INFO] вне времени — пропуск")
         return
 
     service = get_service()
 
+    # 1) один раз получаем списки листов (сильно экономит read-requests)
+    summary_titles_lower = get_sheet_titles_lower(service, SUMMARY_SPREADSHEET_ID)
+    our_titles_lower = get_sheet_titles_lower(service, OUR_GRID_ID)
+    yandex_titles_lower = get_sheet_titles_lower(service, YANDEX_GRID_ID)
+
+    # 2) читаем settings
     settings = read_values(service, SUMMARY_SPREADSHEET_ID, f"{SUMMARY_SETTINGS_SHEET_NAME}!A2:B")
     if not settings:
-        print("[WARN] SUMMARY Settings пустой (A2:B)")
+        print("[WARN] Settings пустой (A2:B)")
         return
 
+    pairs = []
     for row in settings:
         our_name = row[0] if len(row) > 0 else ""
         yandex_name = row[1] if len(row) > 1 else ""
         if (not str(our_name).strip()) and (not str(yandex_name).strip()):
             continue
-        update_one_month(service, str(our_name).strip(), str(yandex_name).strip())
+        pairs.append((str(our_name).strip(), str(yandex_name).strip()))
+
+    if not pairs:
+        print("[WARN] Нет ни одной пары в Settings")
+        return
+
+    # 3) round-robin: за один проход обрабатываем только MAX_MONTHS_PER_RUN
+    start = read_cursor() % len(pairs)
+    end = start + max(1, MAX_MONTHS_PER_RUN)
+    chosen = [pairs[i % len(pairs)] for i in range(start, end)]
+    write_cursor(end % len(pairs))
+
+    for our_name, yandex_name in chosen:
+        update_one_month(
+            service,
+            summary_titles_lower,
+            our_titles_lower,
+            yandex_titles_lower,
+            our_name,
+            yandex_name,
+        )
 
 
 if __name__ == "__main__":
-    try:
-        run_summary_once()
-    except HttpError as e:
-        print("[ERROR] SUMMARY Google API:", e)
-        raise
+    run_summary_once()
