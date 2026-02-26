@@ -12,15 +12,24 @@ load_dotenv()
 SUMMARY_SPREADSHEET_ID = os.environ["SUMMARY_SPREADSHEET_ID"]
 OUR_GRID_ID = os.environ["OUR_GRID_ID"]
 YANDEX_GRID_ID = os.environ["YANDEX_GRID_ID"]
-
 SUMMARY_SETTINGS_SHEET_NAME = os.getenv("SUMMARY_SETTINGS_SHEET_NAME", "Settings")
+
 TZ = os.getenv("TZ", "Asia/Almaty")
 
-MIN_WRITE_INTERVAL_SEC = int(os.getenv("SUMMARY_MIN_WRITE_INTERVAL_SEC", "60"))
+# HOT month: пишем каждые N секунд (15)
+HOT_MONTH = os.getenv("HOT_MONTH", "Февраль 2026")
+HOT_WRITE_INTERVAL_SEC = int(os.getenv("HOT_WRITE_INTERVAL_SEC", "15"))
+
+# COLD months: пишем раз в сутки
+COLD_REFRESH_SEC = int(os.getenv("COLD_REFRESH_SEC", str(24 * 60 * 60)))
+
+# прочее
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
+
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
-MAX_MONTHS_PER_RUN = int(os.getenv("MAX_MONTHS_PER_RUN", "1"))
+
+MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -66,43 +75,6 @@ def find_idx(headers, keywords):
 def compute_hash(values):
     s = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-def state_path(report_sheet_name):
-    safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", report_sheet_name)
-    return f"/tmp/summary_state_{safe}.json"
-
-
-def read_state(report_sheet_name):
-    p = state_path(report_sheet_name)
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def write_state(report_sheet_name, state):
-    p = state_path(report_sheet_name)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(state, f)
-
-
-def cursor_path():
-    return "/tmp/summary_cursor.json"
-
-
-def read_cursor():
-    try:
-        with open(cursor_path(), "r", encoding="utf-8") as f:
-            return json.load(f).get("i", 0)
-    except Exception:
-        return 0
-
-
-def write_cursor(i):
-    with open(cursor_path(), "w", encoding="utf-8") as f:
-        json.dump({"i": i}, f)
 
 
 def api_call_with_backoff(fn, max_retries=8, base_sleep=1.0):
@@ -311,12 +283,8 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     return result
 
 
-def find_anchor_row(service, sheet_id, sheet_title, anchor_text):
-    """
-    Ищем строку, где в A1:M200 встречается anchor_text (например 'НАША СЕТКА' или 'ЯНДЕКС СЕТКА').
-    Возвращаем 1-based row.
-    """
-    values = read_values(service, sheet_id, f"{sheet_title}!A1:M200")
+def find_anchor_row(service, spreadsheet_id, sheet_title, anchor_text):
+    values = read_values(service, spreadsheet_id, f"{sheet_title}!A1:M200")
     anchor_low = anchor_text.lower()
     for r, row in enumerate(values, start=1):
         for c in row:
@@ -326,19 +294,11 @@ def find_anchor_row(service, sheet_id, sheet_title, anchor_text):
 
 
 def update_values_only(service, sheet_title, our_month_name, yandex_month_name, our_data, yandex_data):
-    """
-    НЕ трогаем формат. Обновляем только значения:
-    - title rows остаются как есть (мы не переписываем их, можно переписать при желании)
-    - шапки остаются как есть
-    - переписываем только блоки данных
-    """
-    # ищем где начинается блок "НАША СЕТКА" и "ЯНДЕКС СЕТКА"
     our_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "НАША СЕТКА")
     yandex_title_row = find_anchor_row(service, SUMMARY_SPREADSHEET_ID, sheet_title, "ЯНДЕКС СЕТКА")
 
-    # если нет — значит лист пустой/не размечен: тогда пишем "как есть" начиная с A1
+    # если лист не размечен — пишем fallback
     if not our_title_row or not yandex_title_row:
-        # fallback: просто записать таблицу целиком (значениями)
         values = []
         values.append([f"НАША СЕТКА ({our_month_name or '-'})"] + [""] * 12)
         values.append(HEADERS)
@@ -348,24 +308,67 @@ def update_values_only(service, sheet_title, our_month_name, yandex_month_name, 
         values.append([f"ЯНДЕКС СЕТКА ({yandex_month_name or '-'})"] + [""] * 12)
         values.append(HEADERS)
         values.extend(yandex_data if yandex_data else [])
-
         end_row = len(values)
         write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A1:M{end_row}", values)
         return
 
-    # данные начинаются на 2 строки ниже заголовка (title + header)
     our_data_start = our_title_row + 2
     yandex_data_start = yandex_title_row + 2
 
-    # пишем OUR data
+    # OUR
     if not our_data:
         our_data = [[""] * 13]
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_data_start}:M{our_data_start + len(our_data) - 1}", our_data)
+    our_end = our_data_start + len(our_data) - 1
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_data_start}:M{our_end}", our_data)
 
-    # пишем Yandex data
+    # чистим хвост OUR
+    our_tail_start = our_end + 1
+    our_tail_end = our_data_start + MAX_DATA_ROWS - 1
+    if our_tail_start <= our_tail_end:
+        blanks = [[""] * 13 for _ in range(our_tail_end - our_tail_start + 1)]
+        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{our_tail_start}:M{our_tail_end}", blanks)
+
+    # Yandex
     if not yandex_data:
         yandex_data = [[""] * 13]
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{yandex_data_start}:M{yandex_data_start + len(yandex_data) - 1}", yandex_data)
+    y_end = yandex_data_start + len(yandex_data) - 1
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{yandex_data_start}:M{y_end}", yandex_data)
+
+    # чистим хвост Yandex
+    y_tail_start = y_end + 1
+    y_tail_end = yandex_data_start + MAX_DATA_ROWS - 1
+    if y_tail_start <= y_tail_end:
+        blanks = [[""] * 13 for _ in range(y_tail_end - y_tail_start + 1)]
+        write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{y_tail_start}:M{y_tail_end}", blanks)
+
+
+def cold_state_path():
+    return "/tmp/cold_refresh_state.json"
+
+
+def read_cold_state():
+    try:
+        with open(cold_state_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def write_cold_state(st):
+    with open(cold_state_path(), "w", encoding="utf-8") as f:
+        json.dump(st, f)
+
+
+def should_refresh_cold(key):
+    st = read_cold_state()
+    last = float(st.get(key, 0))
+    return (time.time() - last) >= COLD_REFRESH_SEC
+
+
+def mark_refreshed_cold(key):
+    st = read_cold_state()
+    st[key] = time.time()
+    write_cold_state(st)
 
 
 def run_summary_once():
@@ -381,6 +384,7 @@ def run_summary_once():
     yandex_titles_lower = get_sheet_titles_lower(service, YANDEX_GRID_ID)
 
     settings = read_values(service, SUMMARY_SPREADSHEET_ID, f"{SUMMARY_SETTINGS_SHEET_NAME}!A2:B")
+
     pairs = []
     for row in settings:
         a = row[0] if len(row) > 0 else ""
@@ -392,36 +396,58 @@ def run_summary_once():
         print("[WARN] нет пар в Settings")
         return
 
-    start = read_cursor() % len(pairs)
-    end = start + max(1, MAX_MONTHS_PER_RUN)
-    chosen = [pairs[i % len(pairs)] for i in range(start, end)]
-    write_cursor(end % len(pairs))
+    # --- HOT month always ---
+    hot_pair = None
+    for a, b in pairs:
+        raw = (a or b or "").strip().lower()
+        if raw == HOT_MONTH.strip().lower():
+            hot_pair = (a, b)
+            break
 
-    for our_name, yandex_name in chosen:
+    if hot_pair:
+        our_name, yandex_name = hot_pair
         raw_name = (our_name or yandex_name or "").strip()
         report_sheet_name = f"Сводная - {raw_name}"
 
         our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_name)
         yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_name)
 
-        # hash only from the data blocks (so stable)
         new_hash = compute_hash([our_data, yandex_data])
         st = read_state(report_sheet_name)
 
-        if st.get("hash") == new_hash:
-            print(f"[INFO] NO-CHANGE: {report_sheet_name}")
+        if st.get("hash") != new_hash and (time.time() - float(st.get("last_write_ts", 0)) >= HOT_WRITE_INTERVAL_SEC):
+            real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
+            update_values_only(service, real_title, our_name, yandex_name, our_data, yandex_data)
+            updated = now_local().strftime("%d.%m %H:%M")
+            write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
+            write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
+            print(f"[OK] HOT SYNC: {real_title} ({len(our_data)}+{len(yandex_data)} rows)")
+        else:
+            print(f"[INFO] HOT NO-CHANGE/THROTTLE: {report_sheet_name}")
+    else:
+        print(f"[WARN] HOT_MONTH '{HOT_MONTH}' не найден в Settings")
+
+    # --- COLD months daily ---
+    for a, b in pairs:
+        raw = (a or b or "").strip()
+        if raw.lower() == HOT_MONTH.strip().lower():
             continue
 
-        if time.time() - float(st.get("last_write_ts", 0)) < MIN_WRITE_INTERVAL_SEC:
-            print(f"[INFO] THROTTLE: {report_sheet_name}")
+        cold_key = f"{a}|{b}"
+        if not should_refresh_cold(cold_key):
             continue
+
+        raw_name = raw
+        report_sheet_name = f"Сводная - {raw_name}"
+
+        our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, a)
+        yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, b)
 
         real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
-
-        update_values_only(service, real_title, our_name, yandex_name, our_data, yandex_data)
+        update_values_only(service, real_title, a, b, our_data, yandex_data)
 
         updated = now_local().strftime("%d.%m %H:%M")
         write_values(service, SUMMARY_SPREADSHEET_ID, f"{real_title}!N1", [[f"Обновлено: {updated}"]])
 
-        write_state(report_sheet_name, {"hash": new_hash, "last_write_ts": time.time()})
-        print(f"[OK] SYNC VALUES: {real_title} ({len(our_data)}+{len(yandex_data)} rows)")
+        mark_refreshed_cold(cold_key)
+        print(f"[OK] COLD SYNC (daily): {real_title}")
