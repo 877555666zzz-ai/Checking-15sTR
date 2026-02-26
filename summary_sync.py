@@ -17,21 +17,17 @@ SUMMARY_SETTINGS_SHEET_NAME = os.getenv("SUMMARY_SETTINGS_SHEET_NAME", "Settings
 
 TZ = os.getenv("TZ", "Asia/Almaty")
 
-# HOT month: каждые 15 сек (по умолчанию)
+# HOT month: каждые 15 сек
 HOT_MONTH = os.getenv("HOT_MONTH", "Февраль 2026")
 HOT_WRITE_INTERVAL_SEC = int(os.getenv("HOT_WRITE_INTERVAL_SEC", "15"))
 
 # COLD months: раз в 24 часа
 COLD_REFRESH_SEC = int(os.getenv("COLD_REFRESH_SEC", str(24 * 60 * 60)))
+COLD_MONTHS = {"январь 2026", "декабрь 2025"}  # только эти
 
-# Только эти месяцы обновляем как COLD
-COLD_MONTHS = {"январь 2026", "декабрь 2025"}
-
-# Логика красной зоны и хвоста
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
 MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))
 
-# Временное окно (если нужно)
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
 
@@ -326,9 +322,12 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
 
     result = []
     for m, s in stats.items():
+        # ПИШЕМ ПРОЦЕНТ СТРОКОЙ, ЧТОБЫ НЕ ЗАВИСЕТЬ ОТ ФОРМАТА ЯЧЕЙКИ
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
+        percent_str = f"{round(percent * 100)}%"
+
         result.append([
-            m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent,
+            m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
             s["nib_sale"], s["nib"], s["zero"], s["empty_tag"], s["other_tag"], s["red"]
         ])
 
