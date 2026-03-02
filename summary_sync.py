@@ -9,6 +9,7 @@ from googleapiclient.errors import HttpError
 
 load_dotenv()
 
+# ===== ENV =====
 SUMMARY_SPREADSHEET_ID = os.environ["SUMMARY_SPREADSHEET_ID"]
 OUR_GRID_ID = os.environ["OUR_GRID_ID"]
 YANDEX_GRID_ID = os.environ["YANDEX_GRID_ID"]
@@ -25,16 +26,16 @@ COLD_MONTHS = set(m.strip().lower() for m in os.getenv(
     "Февраль 2026,Январь 2026,Декабрь 2025"
 ).split(","))
 
-RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
 MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))
+RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
 
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
 
 META_TTL_SEC = int(os.getenv("META_TTL_SEC", "600"))
-
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+# ===== Source parse keywords =====
 KEYWORDS = {
     "MANAGER": ["менеджер", "сотрудник", "manager"],
     "OPF": ["опф", "форма"],
@@ -43,9 +44,11 @@ KEYWORDS = {
     "TAGS": ["метки", "наличие метки", "nib"],
 }
 
+# ===== “Do not touch” header detection =====
 HEADER_MARKERS = [
-    "менеджер", "менеджеры", "офферт", "ип", "тоо",
-    "договор", "акцепт", "акцепт %", "пусто", "другое", "красные"
+    "менеджер", "менеджеры", "офферт", "офферты", "ип", "тоо",
+    "договор", "акцепт", "акцепт %", "пусто", "другое", "красные",
+    "метка"
 ]
 
 _META_CACHE = {}
@@ -68,7 +71,7 @@ def api_call_with_backoff(fn, max_retries=8, base_sleep=1.0):
                 time.sleep(sleep_s)
                 continue
             raise
-    raise RuntimeError("Too many retries for Google API")
+    raise RuntimeError("Too many retries")
 
 def get_service():
     sa_json = os.getenv("GCP_SA_JSON")
@@ -120,7 +123,6 @@ def ensure_sheet_exists(service, spreadsheet_id, sheet_name, titles_lower):
         return titles_lower[key]
 
     req = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
-
     def _call():
         return service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
 
@@ -161,6 +163,7 @@ def compute_hash(values):
     s = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+# ===== states =====
 def state_path(report_sheet_name):
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", report_sheet_name)
     return f"/tmp/state_{safe}.json"
@@ -200,56 +203,67 @@ def mark_refreshed_cold(key):
     st[key] = time.time()
     write_cold_state(st)
 
-# ===== AUTO DETECT BLOCKS =====
-def find_title_row(service, sheet_title, label, search_rows=80):
-    """Find row number where merged title contains label (НАША СЕТКА / ЯНДЕКС СЕТКА)."""
-    vals = read_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A1:M{search_rows}")
-    label_l = label.lower()
-    for i, row in enumerate(vals, start=1):
-        txt = " ".join(str(x).strip().lower() for x in row if str(x).strip())
-        if label_l in txt:
-            return i
-    return None
-
+# ===== HARD “DO NOT TOUCH” logic =====
 def row_looks_like_header(row_vals):
     if not row_vals:
         return False
     txt = " ".join(str(x).strip().lower() for x in row_vals if str(x).strip())
+    if not txt:
+        return False
     hits = sum(1 for m in HEADER_MARKERS if m in txt)
     return hits >= 2 or ("менедж" in txt)
 
-def safe_start_row(service, sheet_title, candidate_row):
-    vals = read_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{candidate_row}:M{candidate_row}")
-    row = vals[0] if vals else []
-    if row_looks_like_header(row):
-        return candidate_row + 1
-    return candidate_row
+def find_title_row(service, sheet_title, label, search_rows=120):
+    vals = read_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A1:M{search_rows}")
+    lab = label.lower()
+    for i, row in enumerate(vals, start=1):
+        txt = " ".join(str(x).strip().lower() for x in row if str(x).strip())
+        if lab in txt:
+            return i
+    return None
 
-def get_block_start(service, sheet_title, label):
+def get_block_rows(service, sheet_title, label):
     """
-    Returns (header_row, data_start_row).
-    data_start_row = title_row + 2
+    Returns: title_row, header_row, data_start_row
+    NEVER touch title_row/header_row
     """
     title_row = find_title_row(service, sheet_title, label)
     if not title_row:
-        raise RuntimeError(f"Cannot find block title '{label}' in {sheet_title}")
+        raise RuntimeError(f"Block title '{label}' not found in '{sheet_title}'")
+
     header_row = title_row + 1
     data_start = title_row + 2
-    data_start = safe_start_row(service, sheet_title, data_start)
-    return header_row, data_start
 
+    # Safety: if data_start accidentally points to header -> STOP by shifting ONLY if header detected there
+    vals = read_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{data_start}:M{data_start}")
+    row = vals[0] if vals else []
+    if row_looks_like_header(row):
+        # This means sheet layout is weird; shift once
+        data_start += 1
+
+    # Final safety: if data_start still looks like header -> ABORT (do not write)
+    vals2 = read_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{data_start}:M{data_start}")
+    row2 = vals2[0] if vals2 else []
+    if row_looks_like_header(row2):
+        raise RuntimeError(f"Refusing to write: data_start_row={data_start} looks like HEADER for '{label}' in '{sheet_title}'")
+
+    return title_row, header_row, data_start
+
+# ===== analyze source =====
 def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     if not sheet_name:
         return []
     real_name = find_sheet_smart(source_titles_lower, sheet_name)
     if not real_name:
-        print(f"[WARN] Source tab not found: '{sheet_name}' in spreadsheet {source_id}")
+        print(f"[WARN] Source tab not found: '{sheet_name}' in {source_id}")
         return []
+
     data = read_values(service, source_id, real_name)
     if len(data) < 2:
         return []
 
     headers = [str(h).lower().strip() for h in data[0]]
+
     idx = {
         "man": find_idx(headers, KEYWORDS["MANAGER"]),
         "opf": find_idx(headers, KEYWORDS["OPF"]),
@@ -257,11 +271,12 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
         "accept": find_idx(headers, KEYWORDS["ACCEPT"]),
         "tags": find_idx(headers, KEYWORDS["TAGS"]),
     }
+
     if idx["man"] == -1 and len(data) > 2:
         headers2 = [str(h).lower().strip() for h in data[1]]
         idx["man"] = find_idx(headers2, KEYWORDS["MANAGER"])
     if idx["man"] == -1:
-        print(f"[WARN] Manager column not found in source tab '{real_name}'")
+        print(f"[WARN] Manager column not found in '{real_name}'")
         return []
 
     stats = {}
@@ -335,7 +350,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     result = []
     for m, s in stats.items():
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
-        percent_str = f"{round(percent * 100)}%"  # string
+        percent_str = f"{round(percent * 100)}%"  # always string
         result.append([
             m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
             s["nib_sale"], s["nib"], s["zero"], s["empty_tag"], s["other_tag"], s["red"]
@@ -344,6 +359,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     result.sort(key=lambda x: str(x[0]))
     return result
 
+# ===== write (DATA ONLY) =====
 def _pad_or_trim_row(row, width=13):
     row = list(row) if row else []
     if len(row) < width:
@@ -352,20 +368,24 @@ def _pad_or_trim_row(row, width=13):
         row = row[:width]
     return row
 
-def write_data_block(service, sheet_title, start_row, max_rows, data_rows):
+def write_data_block(service, sheet_title, data_start_row, max_rows, data_rows):
+    """
+    Writes ONLY A{data_start_row}:M{data_start_row+max_rows-1}
+    NEVER touches header/title rows because data_start_row is computed as title+2 and guarded.
+    SAFETY: if data_rows empty -> DO NOTHING (no cleanup).
+    """
     width = 13
     clean = [_pad_or_trim_row(r, width) for r in (data_rows or [])]
     clean = clean[:max_rows]
 
-    # SAFETY: no data -> do not touch anything (no wipe)
     if len(clean) == 0:
-        print(f"[WARN] No data -> skip write/cleanup: {sheet_title} A{start_row}:M{start_row+max_rows-1}")
+        print(f"[WARN] No data -> skip write/cleanup for {sheet_title} start {data_start_row}")
         return
 
-    end_row = start_row + len(clean) - 1
-    block_end_row = start_row + max_rows - 1
+    end_row = data_start_row + len(clean) - 1
+    block_end_row = data_start_row + max_rows - 1
 
-    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{start_row}:M{end_row}", clean)
+    write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{data_start_row}:M{end_row}", clean)
 
     tail_start = end_row + 1
     if tail_start <= block_end_row:
@@ -376,16 +396,16 @@ def run_month_update(service, summary_titles_lower, our_titles_lower, yandex_tit
     report_sheet_name = f"Сводная - {month_name}"
     real_title = ensure_sheet_exists(service, SUMMARY_SPREADSHEET_ID, report_sheet_name, summary_titles_lower)
 
+    # find blocks in SUMMARY sheet (auto, so rows can "float")
+    our_title, our_header, our_data_start = get_block_rows(service, real_title, "НАША СЕТКА")
+    y_title, y_header, y_data_start = get_block_rows(service, real_title, "ЯНДЕКС СЕТКА")
+
+    # analyze sources
     our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_sheet)
     yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_sheet)
 
-    # AUTO DETECT block starts
-    _, our_data_start = get_block_start(service, real_title, "НАША СЕТКА")
-    _, y_data_start = get_block_start(service, real_title, "ЯНДЕКС СЕТКА")
-
-    # For OUR: we still limit cleanup to 16 rows from detected start (safe)
-    write_data_block(service, real_title, our_data_start, 16, our_data)
-    # For Yandex: use MAX_DATA_ROWS
+    # write ONLY data area
+    write_data_block(service, real_title, our_data_start, 16, our_data)           # OUR block: 16 rows safe
     write_data_block(service, real_title, y_data_start, MAX_DATA_ROWS, yandex_data)
 
     updated = now_local().strftime("%d.%m %H:%M:%S")
@@ -405,6 +425,7 @@ def run_summary_once():
     yandex_titles_lower = get_sheet_titles_lower_cached(service, YANDEX_GRID_ID)
 
     settings = read_values(service, SUMMARY_SPREADSHEET_ID, f"{SUMMARY_SETTINGS_SHEET_NAME}!A2:B")
+
     pairs = []
     for row in settings:
         a = row[0] if len(row) > 0 else ""
@@ -413,6 +434,7 @@ def run_summary_once():
         if not month:
             continue
         pairs.append((month, str(a).strip(), str(b).strip()))
+
     if not pairs:
         print("[WARN] Settings empty")
         return
