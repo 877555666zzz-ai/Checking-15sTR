@@ -16,14 +16,16 @@ SUMMARY_SETTINGS_SHEET_NAME = os.getenv("SUMMARY_SETTINGS_SHEET_NAME", "Settings
 
 TZ = os.getenv("TZ", "Asia/Almaty")
 
-HOT_MONTH = os.getenv("HOT_MONTH", "Февраль 2026")
+# ✅ NEW: HOT month = March
+HOT_MONTH = os.getenv("HOT_MONTH", "Март 2026")
 HOT_WRITE_INTERVAL_SEC = int(os.getenv("HOT_WRITE_INTERVAL_SEC", "15"))
 
+# ✅ NEW: February moved to COLD too
 COLD_REFRESH_SEC = int(os.getenv("COLD_REFRESH_SEC", str(24 * 60 * 60)))
-COLD_MONTHS = {"январь 2026", "декабрь 2025"}
+COLD_MONTHS = {"март 2026", "февраль 2026", "январь 2026", "декабрь 2025"}  # note: HOT will be skipped anyway
 
 RED_GAP_ROWS = int(os.getenv("RED_GAP_ROWS", "5"))
-MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))  # ONLY for YANDEX block tail, not for OUR block
+MAX_DATA_ROWS = int(os.getenv("MAX_DATA_ROWS", "60"))  # ONLY for YANDEX block cleanup
 
 WORK_START_HOUR = int(os.getenv("WORK_START_HOUR", "0"))
 WORK_END_HOUR = int(os.getenv("WORK_END_HOUR", "24"))
@@ -32,15 +34,16 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # ====== EXACT LAYOUT (from your screenshots) ======
 # НАША СЕТКА:
-# Row 1 = merged title
-# Row 2 = header
-# Row 3..18 = data area (ONLY!)
+# row 1 title, row 2 header, row 3..18 data
 OUR_DATA_START_ROW = 3
 OUR_DATA_END_ROW = 18
-OUR_MAX_ROWS = OUR_DATA_END_ROW - OUR_DATA_START_ROW + 1  # 16 rows, cleanup stays inside A3:M18 ONLY
+OUR_MAX_ROWS = OUR_DATA_END_ROW - OUR_DATA_START_ROW + 1  # 16 rows, cleanup stays inside A3:M18
 
-# ЯНДЕКС СЕТКА data start depends on month, headers above must never be touched
+# ЯНДЕКС СЕТКА:
+# Feb/Jan/Mar: title row 19, header row 20, data row 21
+# Dec: title row 21, header row 22, data row 23
 YANDEX_DATA_START_BY_MONTH = {
+    "март 2026": 21,
     "февраль 2026": 21,
     "январь 2026": 21,
     "декабрь 2025": 23,
@@ -179,7 +182,7 @@ def find_sheet_smart(titles_lower, partial_name):
     return None
 
 
-# ===== hot state =====
+# ===== HOT state =====
 def state_path(report_sheet_name):
     safe = re.sub(r"[^a-zA-Z0-9_.-]+", "_", report_sheet_name)
     return f"/tmp/state_{safe}.json"
@@ -198,7 +201,7 @@ def write_state(report_sheet_name, state):
         json.dump(state, f)
 
 
-# ===== cold state =====
+# ===== COLD state =====
 def cold_state_path():
     return "/tmp/cold_refresh_state.json"
 
@@ -328,7 +331,7 @@ def analyze_single_sheet(service, source_id, source_titles_lower, sheet_name):
     result = []
     for m, s in stats.items():
         percent = (s["accept"] / s["total"]) if s["total"] > 0 else 0
-        percent_str = f"{round(percent * 100)}%"  # ALWAYS string like "11%"
+        percent_str = f"{round(percent * 100)}%"  # ✅ always string like "11%"
 
         result.append([
             m, s["total"], s["ip"], s["too"], s["contract"], s["accept"], percent_str,
@@ -349,21 +352,21 @@ def _pad_or_trim_row(row, width=13):
 
 
 def write_data_block(service, sheet_title, start_row, max_rows, data_rows):
-    """Writes ONLY within A{start_row}:M{start_row+max_rows-1} and clears tail ONLY inside same block."""
-    width = 13
+    """Writes ONLY within A{start_row}:M{start_row+max_rows-1} and clears tail ONLY inside this same block."""
+    width = 13  # A..M
+
     clean = [_pad_or_trim_row(r, width) for r in (data_rows or [])]
     clean = clean[:max_rows]
-
     if len(clean) == 0:
         clean = [[""] * width]
 
     end_row = start_row + len(clean) - 1
     block_end_row = start_row + max_rows - 1
 
-    # write
+    # write data
     write_values(service, SUMMARY_SPREADSHEET_ID, f"{sheet_title}!A{start_row}:M{end_row}", clean)
 
-    # clear tail INSIDE this block only
+    # clear tail INSIDE block only (never reaches headers of other blocks)
     tail_start = end_row + 1
     if tail_start <= block_end_row:
         blanks = [[""] * width for _ in range(block_end_row - tail_start + 1)]
@@ -381,10 +384,10 @@ def run_month_update(service, summary_titles_lower, our_titles_lower, yandex_tit
     our_data = analyze_single_sheet(service, OUR_GRID_ID, our_titles_lower, our_sheet)
     yandex_data = analyze_single_sheet(service, YANDEX_GRID_ID, yandex_titles_lower, yandex_sheet)
 
-    # НАША СЕТКА: STRICT A3:M18 ONLY (never touches row 1-2 and never clears into row 19-20)
+    # ✅ OUR: strict A3:M18 only
     write_data_block(service, real_title, OUR_DATA_START_ROW, OUR_MAX_ROWS, our_data)
 
-    # ЯНДЕКС СЕТКА: start depends on month; clears ONLY inside its block, never touches header rows above
+    # ✅ YANDEX: strict start row (21/23) and cleanup inside its block only
     y_start = yandex_start_for_month(month_name)
     write_data_block(service, real_title, y_start, MAX_DATA_ROWS, yandex_data)
 
@@ -407,6 +410,7 @@ def run_summary_once():
     yandex_titles_lower = get_sheet_titles_lower(service, YANDEX_GRID_ID)
 
     settings = read_values(service, SUMMARY_SPREADSHEET_ID, f"{SUMMARY_SETTINGS_SHEET_NAME}!A2:B")
+
     pairs = []
     for row in settings:
         a = row[0] if len(row) > 0 else ""
@@ -420,7 +424,7 @@ def run_summary_once():
         print("[WARN] Settings empty")
         return
 
-    # HOT
+    # ========== HOT ==========
     hot = None
     for month, a, b in pairs:
         if month.lower() == HOT_MONTH.strip().lower():
@@ -448,7 +452,7 @@ def run_summary_once():
     else:
         print(f"[WARN] HOT_MONTH '{HOT_MONTH}' not found in Settings")
 
-    # COLD
+    # ========== COLD (daily) ==========
     for month, a, b in pairs:
         ml = month.lower()
         if ml == HOT_MONTH.strip().lower():
@@ -457,6 +461,7 @@ def run_summary_once():
             continue
         if not should_refresh_cold(ml):
             continue
+
         run_month_update(service, summary_titles_lower, our_titles_lower, yandex_titles_lower, month, a, b)
         mark_refreshed_cold(ml)
         print(f"[OK] COLD SYNC (daily): Сводная - {month}")
