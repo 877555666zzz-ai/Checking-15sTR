@@ -1,8 +1,7 @@
-import os
-import time
+import os, time
 from summary_sync import run_summary_once
 
-LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "3"))
+LOOP_SLEEP_SEC = float(os.getenv("LOOP_SLEEP_SEC", "15"))
 
 def main():
     while True:
